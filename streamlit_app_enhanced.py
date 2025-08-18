@@ -2,9 +2,12 @@ import os
 import json
 from typing import List, Dict, Any
 from pathlib import Path
+import tempfile
+import zipfile
 
 import streamlit as st
 from dotenv import load_dotenv
+import requests
 
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -57,10 +60,6 @@ Answer:
 
 Sources:
 """
-
-
-
-
 
 def get_api_key() -> str:
     """Resolve OpenAI API key from session, secrets, or environment."""
@@ -386,6 +385,29 @@ def main():
         
         # Database info (simplified)
         st.subheader("🗄️ Database")
+        # Try auto-download if not present
+        if not os.path.isdir(DB_DIR):
+            db_url = ""
+            try:
+                db_url = st.secrets.get("CHROMA_DB_URL", "")
+            except Exception:
+                db_url = os.getenv("CHROMA_DB_URL", "")
+            if db_url:
+                try:
+                    with st.spinner("Downloading vector DB (first run only)..."):
+                        tmp_dir = tempfile.mkdtemp()
+                        zip_path = os.path.join(tmp_dir, "chroma_db.zip")
+                        with requests.get(db_url, stream=True, timeout=180) as r:
+                            r.raise_for_status()
+                            with open(zip_path, "wb") as f:
+                                for chunk in r.iter_content(chunk_size=8192):
+                                    if chunk:
+                                        f.write(chunk)
+                        with zipfile.ZipFile(zip_path, "r") as zf:
+                            zf.extractall(PROJECT_ROOT)
+                except Exception as e:
+                    st.error(f"❌ Failed to download DB: {e}")
+
         if os.path.isdir(DB_DIR):
             try:
                 vectorstore = get_vectorstore(DB_DIR, DEFAULT_COLLECTION, api_key=get_api_key())
@@ -398,6 +420,7 @@ def main():
                 st.error(f"DB Error: {e}")
         else:
             st.error("❌ Vector DB not found")
+            st.info("Set a secret `CHROMA_DB_URL` (zip of the `chroma_db/` folder) to auto-download at startup.")
 
     # Main chat area
     main_container = st.container()
@@ -467,10 +490,33 @@ def main():
         # Display user question immediately
         st.markdown(f'<div class="message-container"><div class="user-message"><strong>You:</strong> {question}</div></div>', unsafe_allow_html=True)
         
-        # Check prerequisites
+        # Ensure DB exists (attempt auto-download here too as a backup)
         if not os.path.isdir(DB_DIR):
-            st.error("❌ Vector DB not found. Please run the pipeline to build and persist the Chroma DB first.")
-            st.info("💡 Run `python main.py` to process your PDFs and create the vector database.")
+            db_url_env = os.getenv("CHROMA_DB_URL", "")
+            db_url_secret = ""
+            try:
+                db_url_secret = st.secrets.get("CHROMA_DB_URL", "")
+            except Exception:
+                pass
+            db_url = db_url_secret or db_url_env
+            if db_url:
+                try:
+                    with st.spinner("Downloading vector DB (first run only)..."):
+                        tmp_dir = tempfile.mkdtemp()
+                        zip_path = os.path.join(tmp_dir, "chroma_db.zip")
+                        with requests.get(db_url, stream=True, timeout=180) as r:
+                            r.raise_for_status()
+                            with open(zip_path, "wb") as f:
+                                for chunk in r.iter_content(chunk_size=8192):
+                                    if chunk:
+                                        f.write(chunk)
+                        with zipfile.ZipFile(zip_path, "r") as zf:
+                            zf.extractall(PROJECT_ROOT)
+                except Exception as e:
+                    st.error(f"❌ Failed to download DB: {e}")
+
+        if not os.path.isdir(DB_DIR):
+            st.error("❌ Vector DB not found. Provide `CHROMA_DB_URL` secret/env (zip of `chroma_db/`) or build it with your pipeline.")
             return
 
         resolved_api_key = get_api_key()
