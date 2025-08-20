@@ -14,6 +14,9 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.documents import Document
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain_community.document_compressors import FlashrankRerank
+from flashrank import Ranker
 
 # ----- Environment & Constants -----
 load_dotenv()
@@ -98,8 +101,8 @@ def format_docs(docs) -> str:
         page_num = doc.metadata.get("page_number", "Unknown page")
         category = doc.metadata.get("category", "")
         source_info = f"\n\nSource: {filename} (Page {page_num})"
-        if category:
-            source_info += f" [{category}]"
+        # if category:
+        #     source_info += f" [{category}]"
         formatted_texts.append((doc.page_content or "") + source_info)
     return "\n\n".join(formatted_texts)
 
@@ -116,6 +119,30 @@ def build_chain(retriever, model_name: str, temperature: float, api_key: str = "
         | llm
     )
     return chain
+
+def create_reranking_retriever(base_retriever, top_n: int = 3, model_name: str = "ms-marco-MiniLM-L-12-v2"):
+    """Create a FlashRank reranking retriever with contextual compression."""
+    try:
+        # Initialize FlashRank ranker
+        ranker = Ranker(model_name=model_name)
+        
+        # Create FlashRank reranker compressor
+        compressor = FlashrankRerank(
+            client=ranker, 
+            model=model_name, 
+            top_n=top_n
+        )
+        
+        # Create contextual compression retriever
+        compression_retriever = ContextualCompressionRetriever(
+            base_compressor=compressor, 
+            base_retriever=base_retriever
+        )
+        
+        return compression_retriever
+    except Exception as e:
+        st.warning(f"⚠️ FlashRank reranking failed: {e}. Falling back to basic retriever.")
+        return base_retriever
 
 def get_collection_stats(vectorstore: Chroma) -> Dict[str, Any]:
     """Get collection statistics."""
@@ -147,7 +174,11 @@ def initialize_session_state():
     if "temperature" not in st.session_state:
         st.session_state.temperature = 0.0
     if "top_k" not in st.session_state:
-        st.session_state.top_k = 5
+        st.session_state.top_k = 10
+    if "use_reranking" not in st.session_state:
+        st.session_state.use_reranking = True
+    if "rerank_top_n" not in st.session_state:
+        st.session_state.rerank_top_n = 3
 
 def main():
     st.set_page_config(
@@ -362,9 +393,18 @@ def main():
         top_k = st.slider("Top-K Documents", 1, 15, st.session_state.top_k, help="Number of documents to retrieve")
         stream_resp = st.checkbox("Stream response", value=True, help="Show response as it's being generated")
         
+        # Reranking settings
+        st.divider()
+        st.subheader("🎯 Reranking")
+        use_reranking = st.checkbox("Enable FlashRank reranking", value=st.session_state.use_reranking, help="Use contextual compression to improve document relevance")
+        rerank_top_n = st.slider("Rerank Top-N", 1, 10, st.session_state.rerank_top_n, help="Number of documents to keep after reranking")
+        show_debug = st.checkbox("Show retrieval debug info", value=False, help="Display base retriever vs reranked results")
+        
         # Update session state
         st.session_state.temperature = temperature
         st.session_state.top_k = top_k
+        st.session_state.use_reranking = use_reranking
+        st.session_state.rerank_top_n = rerank_top_n
         
         # Quick settings
         st.divider()
@@ -374,11 +414,15 @@ def main():
             if st.button("🎯 Precise", help="Low temperature, focused responses"):
                 st.session_state.temperature = 0.0
                 st.session_state.top_k = 3
+                st.session_state.use_reranking = True
+                st.session_state.rerank_top_n = 3
                 st.rerun()
         with col2:
             if st.button("🧠 Creative", help="Higher temperature, more creative responses"):
                 st.session_state.temperature = 0.7
                 st.session_state.top_k = 8
+                st.session_state.use_reranking = True
+                st.session_state.rerank_top_n = 5
                 st.rerun()
         
         st.divider()
@@ -490,6 +534,12 @@ def main():
         # Display user question immediately
         st.markdown(f'<div class="message-container"><div class="user-message"><strong>You:</strong> {question}</div></div>', unsafe_allow_html=True)
         
+        # Show reranking status
+        if use_reranking:
+            st.info(f"🎯 Using FlashRank reranking (Top-{rerank_top_n} documents)")
+        else:
+            st.info("🔍 Using basic similarity search")
+        
         # Ensure DB exists (attempt auto-download here too as a backup)
         if not os.path.isdir(DB_DIR):
             db_url_env = os.getenv("CHROMA_DB_URL", "")
@@ -527,7 +577,43 @@ def main():
         # Initialize vector store and chain
         try:
             vectorstore = get_vectorstore(DB_DIR, DEFAULT_COLLECTION, api_key=resolved_api_key)
-            retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": top_k})
+            base_retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": top_k})
+            
+            # Debug: Show base retriever results
+            if show_debug:
+                st.info("🔍 **Base Retriever Results:**")
+
+                base_docs = base_retriever.get_relevant_documents(question)
+                for i, doc in enumerate(base_docs, 1):
+                    filename = doc.metadata.get("filename", "Unknown")
+                    page_num = doc.metadata.get("page_number", "Unknown")
+                    st.write(f"**{i}.** {filename} (Page {page_num})")
+                    print("Base Retriever Results:")
+                    print(f"{i}. {filename} (Page {page_num})")
+                    #st.write(f"Content: {doc.page_content[:200]}...")
+                    st.write("---")
+                print("---"*7)
+
+            
+            # Apply reranking if enabled
+            if use_reranking:
+                if show_debug:
+                    st.info("🎯 **FlashRank Reranked Results:**")
+                retriever = create_reranking_retriever(base_retriever, top_n=rerank_top_n)
+                if show_debug:
+                    reranked_docs = retriever.get_relevant_documents(question)
+                    for i, doc in enumerate(reranked_docs, 1):
+                        filename = doc.metadata.get("filename", "Unknown")
+                        page_num = doc.metadata.get("page_number", "Unknown")
+                        st.write(f"**{i}.** {filename} (Page {page_num})")
+                        print("FlashRank Reranked Results:")
+                        print(f"{i}. {filename} (Page {page_num})")
+                        #st.write(f"Content: {doc.page_content[:200]}...")
+                        st.write("---")
+                    print("---"*7)
+            else:
+                retriever = base_retriever
+                
             chain = build_chain(retriever, model_name="gpt-4o-mini", temperature=temperature, api_key=resolved_api_key)
             
             # Generate response
